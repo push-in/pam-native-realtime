@@ -32,5 +32,5 @@ private final class RealtimeConnection:NSObject,URLSessionWebSocketDelegate,@unc
     private func deliver(_ event:RealtimeWireEvent,to completion:ModuleCompletion){do{completion(.success,try WireMap.encode(["kind":.integer(Int64(event.kind)),"payload":.text(event.payload),"code":.integer(Int64(event.code))]))}catch{completion(.failure,Data(String(describing:error).utf8))}}
 }
 private struct RealtimeWireEvent{let kind:Int;var payload="";var code=0;var terminal:Bool{kind==4||kind==5}}
-private extension NSLock{func pamLocked<T>(_ body:()->T)->T{lock();defer{unlock()};return body()}}
+private extension NSLock{func pamLocked<T>(_ body:()throws->T)rethrows->T{lock();defer{unlock()};return try body()}}
 private enum RealtimeError:Error{case invalidRequest;case unknownConnection;case pollPending;case closed;case messageTooLarge}
