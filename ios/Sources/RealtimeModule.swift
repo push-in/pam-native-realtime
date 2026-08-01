@@ -1,0 +1,36 @@
+import Foundation
+import PamNative
+
+public final class RealtimeModule:NativeModule,ClosableNativeModule,@unchecked Sendable{
+    private let lock=NSLock();private var connections:[String:RealtimeConnection]=[:]
+    public init(){}
+    public func invoke(method:String,payload:Data,completion:@escaping ModuleCompletion){do{let v=try WireMap.decode(payload);switch method{
+    case "connect":guard case let .text(urlText)?=v["url"],case let .text(headersJson)?=v["headers"],case let .text(protocolsText)?=v["protocols"],case let .integer(maxBytes)?=v["maxMessageBytes"],let url=URL(string:urlText)else{throw RealtimeError.invalidRequest};var request=URLRequest(url:url);if let data=headersJson.data(using:.utf8),let headers=try JSONSerialization.jsonObject(with:data)as?[String:String]{headers.forEach{request.setValue($1,forHTTPHeaderField:$0)}};if !protocolsText.isEmpty{request.setValue(protocolsText,forHTTPHeaderField:"Sec-WebSocket-Protocol")};let id=UUID().uuidString;let connection=RealtimeConnection(id:id,request:request,maxBytes:Int(maxBytes)){[weak self] id in self?.remove(id)};lock.pamLocked{connections[id]=connection};connection.start();succeed(["identifier":.text(id)],completion)
+    case "send":let c=try connection(v);guard case let .text(payload)?=v["payload"],case let .flag(binary)?=v["binary"]else{throw RealtimeError.invalidRequest};c.send(payload:payload,binary:binary){error in if let error{completion(.failure,Data(error.localizedDescription.utf8))}else{self.succeed([:],completion)}}
+    case "poll":let c=try connection(v);guard case let .integer(timeout)?=v["timeoutMillis"]else{throw RealtimeError.invalidRequest};try c.poll(timeoutMillis:Int(timeout),completion:completion)
+    case "state":succeed(["state":.integer(Int64(try connection(v).state))],completion)
+    case "close":let c=try connection(v);guard case let .integer(code)?=v["code"],case let .text(reason)?=v["reason"]else{throw RealtimeError.invalidRequest};c.close(code:Int(code),reason:reason);succeed([:],completion)
+    default:throw RealtimeError.invalidRequest}}catch{completion(.failure,Data(String(describing:error).utf8))}}
+    public func close(){let all=lock.pamLocked{let value=Array(connections.values);connections.removeAll();return value};all.forEach{$0.close(code:1001,reason:"Runtime closed")}}
+    private func connection(_ v:[String:WireValue])throws->RealtimeConnection{guard case let .text(id)?=v["identifier"],let c=lock.pamLocked({connections[id]})else{throw RealtimeError.unknownConnection};return c}
+    private func remove(_ id:String){lock.pamLocked{connections.removeValue(forKey:id)}}
+    private func succeed(_ values:[String:WireValue],_ completion:ModuleCompletion){do{completion(.success,try WireMap.encode(values))}catch{completion(.failure,Data(String(describing:error).utf8))}}
+}
+
+private final class RealtimeConnection:NSObject,URLSessionWebSocketDelegate,@unchecked Sendable{
+    let id:String;let maxBytes:Int;private let request:URLRequest;private let removed:(String)->Void;private let lock=NSLock();private var events:[RealtimeWireEvent]=[];private var waiter:ModuleCompletion?;private var pollGeneration=0;private var task:URLSessionWebSocketTask?;private var session:URLSession?;private(set)var state=1
+    init(id:String,request:URLRequest,maxBytes:Int,removed:@escaping(String)->Void){self.id=id;self.request=request;self.maxBytes=maxBytes;self.removed=removed}
+    func start(){let session=URLSession(configuration:.ephemeral,delegate:self,delegateQueue:nil);self.session=session;let task=session.webSocketTask(with:request);task.maximumMessageSize=maxBytes;self.task=task;task.resume();receive()}
+    func send(payload:String,binary:Bool,complete:@escaping(Error?)->Void){guard let task else{complete(RealtimeError.closed);return};let message:URLSessionWebSocketTask.Message;if binary{guard let data=Data(base64Encoded:payload),data.count<=maxBytes else{complete(RealtimeError.messageTooLarge);return};message=.data(data)}else{guard payload.utf8.count<=maxBytes else{complete(RealtimeError.messageTooLarge);return};message=.string(payload)};task.send(message,completionHandler:complete)}
+    func poll(timeoutMillis:Int,completion:@escaping ModuleCompletion)throws{let ready:RealtimeWireEvent?;let generation:Int;(ready,generation)=try lock.pamLocked{if waiter != nil{throw RealtimeError.pollPending};if !events.isEmpty{return(events.removeFirst(),pollGeneration)};pollGeneration+=1;waiter=completion;return(nil,pollGeneration)};if let ready{deliver(ready,to:completion);if ready.terminal{removed(id)};return};DispatchQueue.global().asyncAfter(deadline:.now()+Double(timeoutMillis)/1000){let pending:ModuleCompletion?=self.lock.pamLocked{guard self.pollGeneration==generation else{return nil};let value=self.waiter;self.waiter=nil;self.pollGeneration+=1;return value};if let pending{self.deliver(RealtimeWireEvent(kind:7),to:pending)}}}
+    func close(code:Int,reason:String){state=3;task?.cancel(with:URLSessionWebSocketTask.CloseCode(rawValue:code) ?? .normalClosure,reason:Data(reason.utf8))}
+    func urlSession(_ session:URLSession,webSocketTask:URLSessionWebSocketTask,didOpenWithProtocol protocol:String?){state=2;offer(RealtimeWireEvent(kind:1))}
+    func urlSession(_ session:URLSession,webSocketTask:URLSessionWebSocketTask,didCloseWith closeCode:URLSessionWebSocketTask.CloseCode,reason:Data?){state=4;offer(RealtimeWireEvent(kind:4,payload:reason.flatMap{String(data:$0,encoding:.utf8)} ?? "",code:Int(closeCode.rawValue)));session.finishTasksAndInvalidate()}
+    func urlSession(_ session:URLSession,task:URLSessionTask,didCompleteWithError error:Error?){guard let error,state != 4 else{return};state=5;offer(RealtimeWireEvent(kind:5,payload:error.localizedDescription));session.invalidateAndCancel()}
+    private func receive(){task?.receive{[weak self] result in guard let self else{return};switch result{case let .success(message):switch message{case let .string(text):if text.utf8.count<=self.maxBytes{self.offer(RealtimeWireEvent(kind:2,payload:text))}else{self.close(code:1009,reason:"Message too large")};case let .data(data):if data.count<=self.maxBytes{self.offer(RealtimeWireEvent(kind:3,payload:data.base64EncodedString()))}else{self.close(code:1009,reason:"Message too large")};@unknown default:break};self.receive();case let .failure(error):self.state=5;self.offer(RealtimeWireEvent(kind:5,payload:error.localizedDescription))}}}
+    private func offer(_ event:RealtimeWireEvent){let pending:ModuleCompletion?=lock.pamLocked{if let current=waiter{waiter=nil;pollGeneration+=1;return current};if events.count>=256{events.removeFirst()};events.append(event);return nil};if let pending{deliver(event,to:pending);if event.terminal{removed(id)}}}
+    private func deliver(_ event:RealtimeWireEvent,to completion:ModuleCompletion){do{completion(.success,try WireMap.encode(["kind":.integer(Int64(event.kind)),"payload":.text(event.payload),"code":.integer(Int64(event.code))]))}catch{completion(.failure,Data(String(describing:error).utf8))}}
+}
+private struct RealtimeWireEvent{let kind:Int;var payload="";var code=0;var terminal:Bool{kind==4||kind==5}}
+private extension NSLock{func pamLocked<T>(_ body:()->T)->T{lock();defer{unlock()};return body()}}
+private enum RealtimeError:Error{case invalidRequest;case unknownConnection;case pollPending;case closed;case messageTooLarge}
