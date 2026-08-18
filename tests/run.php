@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+$packageAutoload=dirname(__DIR__).'/vendor/autoload.php';if(is_file($packageAutoload))require$packageAutoload;
 $roots=['Pam\\Native\\Realtime\\'=>dirname(__DIR__).'/src/','Pam\\Native\\Testing\\'=>dirname(__DIR__,2).'/pam-native-testing/src/','Pam\\Native\\'=>dirname(__DIR__,2).'/../pam-native/packages/native/src/'];spl_autoload_register(static function(string$c)use($roots):void{foreach($roots as$p=>$r)if(str_starts_with($c,$p)){$f=$r.str_replace('\\','/',substr($c,strlen($p))).'.php';if(is_file($f))require$f;return;}});
 use Pam\Native\Internal\Wire;use Pam\Native\Realtime\Realtime;use Pam\Native\Realtime\RealtimeEventKind;use Pam\Native\Testing\NativeTestHarness;
 $tests=[];$test=static function(string$n,Closure$f)use(&$tests):void{$tests[$n]=$f;};
