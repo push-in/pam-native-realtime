@@ -1,20 +1,54 @@
+<!-- pam:product-page:start -->
+<div align="center">
+
 # PAM Native Realtime
 
-## Start here
+**Persistent WebSockets with bounded delivery semantics.**
 
-This is a Composer extension for PAM Native. Install the PAM Runtime, create a native project, and then add this package through PAM’s verified Composer toolchain:
+Maintain native socket connections across application lifecycle changes and expose controlled typed events to PHP.
+
+[![Latest version](https://img.shields.io/packagist/v/pushinbr/pam-native-realtime?style=flat-square&label=stable)](https://packagist.org/packages/pushinbr/pam-native-realtime)
+[![CI](https://img.shields.io/github/actions/workflow/status/push-in/pam-native-realtime/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/push-in/pam-native-realtime/actions)
+![PHP](https://img.shields.io/badge/PHP-8.5-777BB4?style=flat-square&logo=php&logoColor=white)
+![Android](https://img.shields.io/badge/Android-API%2026%2B-3DDC84?style=flat-square&logo=android&logoColor=white)
+![iOS](https://img.shields.io/badge/iOS-15%2B-000000?style=flat-square&logo=apple&logoColor=white)
+
+**[Documentation](https://push-in.github.io/pam-docs/native/overview/) · [Quick start](#quick-start) · [What you can build](#what-you-can-build) · [PAM ecosystem](https://push-in.github.io/pam-docs/ecosystem/) · [Issues](https://github.com/push-in/pam-native-realtime/issues)**
+
+</div>
+
+---
+
+## Why PAM Native Realtime
+
+Maintain native socket connections across application lifecycle changes and expose controlled typed events to PHP. The public API is strictly typed for PHP 8.5; expensive or frame-sensitive work stays in Rust or the platform SDK instead of crossing the application boundary every frame.
+
+| | |
+| --- | --- |
+| **Best for** | A focused capability you can add to any PAM Native application |
+| **Native path** | OkHttp WebSocket · URLSessionWebSocketTask |
+| **Application model** | Composer package + generated native integration |
+| **Design rule** | Independent module; no feed, vertical, or application template bundled |
+
+## What you can build
+
+- Chat, presence, and collaborative state
+- Live dashboards and operations consoles
+- Realtime alerts and server-driven updates
+
+## Quick start
+
+Already have a PAM Native project? Add only this capability:
 
 ```bash
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    --connect-timeout 15 --max-time 60 --max-filesize 1048576 -fsSL \
-    https://github.com/push-in/pam/releases/latest/download/install.sh | sh
-
-pam init my-app --template native
-cd my-app
 pam composer require pushinbr/pam-native-realtime
 pam doctor --fix
 ```
 
+New to PAM? Follow the **[five-minute PAM Native setup](https://push-in.github.io/pam-docs/native/overview/)** once, then return here. Your application stays a normal Composer project with a committed lockfile.
+<!-- pam:product-page:end -->
+
+## See it in action
 
 Persistent RFC 6455 connections owned by the native runtime. PHP can render, suspend or reload without implementing socket framing or holding a network loop.
 
@@ -31,8 +65,7 @@ $realtime->poll($id, function (?Pam\Native\Realtime\RealtimeEvent $event, ?strin
 
 Only `wss://` endpoints are accepted. Text and binary frames are bounded per connection. Incoming events use a 256-item native queue and one pending long poll, with deterministic timeout and lifecycle cleanup. Android uses OkHttp `5.3.0`; iOS uses URLSessionWebSocketTask.
 
-Platform support: Android API 26+, iOS 15+, PAM Native 0.6.x.
-
+Platform support: Android API 26+, iOS 15+, PAM Native 0.8.x.
 
 ## What installation does
 
@@ -67,7 +100,7 @@ All coded states, kinds, and variants are sequential integer-backed enums. Use e
 
 ## Compatibility and support
 
-This package targets PAM Native `0.6.x`, Android API 26+, and iOS 15+ unless a platform-specific section above states a stricter requirement. Platform SDKs, credentials, entitlements, physical hardware, and store configuration remain application responsibilities.
+This package targets PAM Native `0.8.x`, Android API 26+, and iOS 15+ unless a platform-specific section above states a stricter requirement. Platform SDKs, credentials, entitlements, physical hardware, and store configuration remain application responsibilities.
 
 - [PAM documentation](https://push-in.github.io/pam-docs/introduction/)
 - [PAM Native overview](https://push-in.github.io/pam-docs/native/overview/)
