@@ -3,9 +3,9 @@
 
 # PAM Native Realtime
 
-**Persistent WebSockets with bounded delivery semantics.**
+**Laravel Echo for PAM Native: Pusher and Reverb channels, owned by the platform.**
 
-Maintain native socket connections across application lifecycle changes and expose controlled typed events to PHP.
+Laravel Echo style Pusher/Reverb channels with native reconnects and batched delivery.
 
 [![Latest version](https://img.shields.io/packagist/v/pushinbr/pam-native-realtime?style=flat-square&label=stable)](https://packagist.org/packages/pushinbr/pam-native-realtime)
 [![CI](https://img.shields.io/github/actions/workflow/status/push-in/pam-native-realtime/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/push-in/pam-native-realtime/actions)
@@ -21,7 +21,7 @@ Maintain native socket connections across application lifecycle changes and expo
 
 ## Why PAM Native Realtime
 
-Maintain native socket connections across application lifecycle changes and expose controlled typed events to PHP. The public API is strictly typed for PHP 8.5; expensive or frame-sensitive work stays in Rust or the platform SDK instead of crossing the application boundary every frame.
+Subscribe to public, private and presence channels on Pusher Channels, Laravel Reverb or Soketi. The socket, the protocol, channel auth, heartbeats, reconnects and re-subscription run natively; PHP receives coalesced batches. The public API is strictly typed for PHP 8.5; expensive or frame-sensitive work stays in Rust or the platform SDK instead of crossing the application boundary every frame.
 
 | | |
 | --- | --- |
@@ -50,22 +50,72 @@ New to PAM? Follow the **[five-minute PAM Native setup](https://push-in.github.i
 
 ## See it in action
 
-Persistent RFC 6455 connections owned by the native runtime. PHP can render, suspend or reload without implementing socket framing or holding a network loop.
-
-```bash
-pam add realtime
-pam doctor
-```
-
 ```php
-$realtime = new Pam\Native\Realtime\Realtime();
-$realtime->connect('wss://api.example.com/socket', ['Authorization' => 'Bearer '.$token], ['pam.v1'], function (?string $id, ?string $error): void {});
-$realtime->poll($id, function (?Pam\Native\Realtime\RealtimeEvent $event, ?string $error): void {});
+use Pam\Native\Realtime\PresenceMember;
+use Pam\Native\Realtime\Realtime;
+use Pam\Native\Realtime\RealtimeMessage;
+use Pam\Native\Realtime\RealtimeStatus;
+use Pam\Native\Realtime\Secret;
+
+// Once, after sign-in (Laravel Reverb / Pusher Channels / Soketi).
+Realtime::pusher('wss://ws.example.com', key: 'app-key')            // or Realtime::reverb('ws.example.com', 'app-key')
+    ->auth('https://api.example.com/broadcasting/auth', Secret::value($token))
+    ->header('Origin', 'https://example.com')
+    ->onConnected(fn (RealtimeStatus $s) => $this->catchUp())        // first connect and every reconnect
+    ->connect();
+
+// Echo style channels, from any screen.
+Realtime::channel('private-chat.42')                                 // or Realtime::private('chat.42')
+    ->listen('message.sent', fn (RealtimeMessage $m) => $this->append($m->json()))
+    ->listenForWhisper('typing', fn (RealtimeMessage $m) => $this->typing($m->userId));
+
+Realtime::join('chat-typing.42')                                     // presence-chat-typing.42
+    ->here(fn (array $members) => $this->online = count($members))
+    ->joining(fn (PresenceMember $m) => ...)
+    ->leaving(fn (PresenceMember $m) => ...)
+    ->whisper('typing', ['typing' => true]);                         // sent as client-typing
+
+Realtime::leave('chat.42');                                          // leaves chat.42, private-… and presence-…
+Realtime::token($refreshed);                                         // new bearer; 401/403 channels retry at once
+$headers['X-Socket-ID'] = Realtime::socketId() ?? '';                 // Laravel toOthers()
 ```
 
-Only `wss://` endpoints are accepted. Text and binary frames are bounded per connection. Incoming events use a 256-item native queue and one pending long poll, with deterministic timeout and lifecycle cleanup. Android uses OkHttp `5.3.0`; iOS uses URLSessionWebSocketTask.
+### One render per burst
 
-Platform support: Android API 26+, iOS 15+, PAM Native 0.8.x.
+Every PHP callback costs a full render in PAM Native, so frames never cross
+one by one. The native client buffers events and completes PHP's single
+pending read with **one batch** once the stream has been quiet for 32 ms (at
+most 150 ms after the first buffered event; tune with `->coalesce()`). Within a
+batch, the connection state, repeated whispers of the same sender and channel
+errors are coalesced to their latest value; server events are never merged
+and keep their order. If PHP is suspended long enough to overflow the bounded
+queue (`->buffer()`), `onDropped(fn (int $count))` tells you to resynchronize.
+
+There is no polling and no PHP timer: the read is a pending native completion,
+like `Sensors::watch()`.
+
+### Connection lifecycle (native)
+
+- `ConnectionState`: `Connecting`, `Connected`, `Unavailable` (reconnect
+  scheduled), `Disconnected` (explicit) and `Failed` (Pusher 4000-4099, retried
+  after `->terminalRetry()` — 5 minutes by default, the Reverb `4009` case).
+- Reconnect with jittered exponential backoff (`->backoff(400, 15000, 1.8)`),
+  immediately for 4200-4299, after backoff for 4100-4199.
+- `pusher:ping` after `activity_timeout` of silence (server value or
+  `->heartbeat()`), reconnect when nothing answers in 12 s; a handshake that
+  does not finish in 10 s is retried.
+- Network callbacks: when connectivity returns, a pending backoff is skipped;
+  when the default network changes, the socket is probed.
+- Every channel is re-authorized and re-subscribed after each reconnect.
+  Auth failures retry with backoff (350 ms – 8 s), `401`/`403` after 60 s or
+  right after `Realtime::token()`.
+- Outbound whispers are throttled natively to one frame per 100 ms per event
+  (the newest payload wins), within the Pusher client-event limit.
+- `Realtime::status(fn (RealtimeStatus $s) => ...)` returns the state, socket id,
+  channels and a 40-entry diagnostic journal for support screens.
+
+Hot reload safe: connecting again with the same name (`connect('default')`)
+replaces the native client.
 
 ## What installation does
 
@@ -77,30 +127,43 @@ Use `pam packages` to inspect availability and `pam remove realtime` to uninstal
 
 | API | Responsibility |
 | --- | --- |
-| `Realtime` | Connect, send text/binary, poll, inspect state, and close. |
-| `RealtimeEvent` / `RealtimeEventKind` | Consume normalized message, lifecycle, and timeout events. |
-| `RealtimeConnectionState` | Read the typed connection state. |
+| `Realtime` | Static facade: `pusher()`, `reverb()`, `channel()`, `private()`, `join()`, `presence()`, `leave()`, `token()`, `reconnect()`, `socketId()`, `state()`, `status()`, `disconnect()`, `connection($name)`. |
+| `PusherConnector` | `auth()`, `bearer()`, `header()`, `backoff()`, `heartbeat()`, `handshakeTimeout()`, `terminalRetry()`, `coalesce()`, `buffer()`, `namespace()`, `onState()`, `onConnected()`, `onDropped()`, `connect()`. |
+| `RealtimeConnection` | The live connection behind the facade (several named connections are supported). |
+| `Channel` / `PresenceChannel` | `listen()`, `listenForWhisper()`, `listenToAll()`, `stopListening()`, `whisper()`, `subscribed()`, `error()`, `leave()`; presence adds `here()`, `joining()`, `leaving()`, `members()`. |
+| `RealtimeMessage`, `PresenceMember`, `SubscriptionError`, `RealtimeStatus` | Typed payloads. `RealtimeMessage::$data` is the decoded JSON payload. |
+| `ConnectionState`, `ChannelType` | Sequential int-backed enums. |
+| `Secret` | Redacted bearer value (kept in memory only, never in snapshots). |
+| `RealtimeSocket` | Low-level raw RFC 6455 socket (text/binary frames, long-poll reads) for non-Pusher protocols. |
 
-All coded states, kinds, and variants are sequential integer-backed enums. Use enum cases in application code; do not depend on raw wire numbers.
+Event names: leading dots are ignored, so `listen('message.sent')` matches a
+`broadcastAs()` name sent as `message.sent` or `.message.sent`. With
+`->namespace('App\Events')`, names without a leading dot are prefixed like
+Laravel Echo.
+
+## Platform support
+
+Android API 26+ (OkHttp `5.3.0`). On iOS 15+ only `RealtimeSocket` is
+available in this release; the Pusher channel methods report a module failure.
+PAM Native `>=1.0.35 <2.0.0`. End-to-end encrypted channels
+(`private-encrypted-*`) are rejected.
+
+## Testing
+
+```bash
+pam tests/run.php                                                    # PHP contracts (fake native transport)
+cd android && ANDROID_SERIAL=emulator-5558 \
+  ../../../pam-native/android/gradlew -p . connectedDebugAndroidTest   # Pusher protocol suite against MockWebServer
+```
 
 ## Production checklist
 
-- Accept only authenticated `wss://` endpoints.
-- Poll continuously while connected and handle bounded-queue pressure.
-- Reconnect with jittered bounded backoff and refresh credentials when required.
+- Accept only authenticated `wss://` endpoints and an `https://` auth endpoint.
+- Refresh credentials with `Realtime::token()` instead of reconnecting.
+- Resynchronize from your API in `onConnected` (reconnects) and `onDropped`.
 - Run `pam doctor`, `pam test`, and a signed release build on every supported platform.
-- Exercise denial, cancellation, backgrounding, process restart, and offline behavior before release.
-
-## Troubleshooting
-
-- **Connection is rejected:** verify TLS, headers, subprotocols, and server upgrade support.
-- **Poll returns timeouts:** treat them as lifecycle ticks, not fatal errors.
-- **Messages are dropped:** reduce producer rate or consume the 256-item queue faster.
-- **Native integration is stale:** run `pam doctor --fix`, rebuild the native host, and inspect the first reported diagnostic.
 
 ## Compatibility and support
-
-This package targets PAM Native `0.8.x`, Android API 26+, and iOS 15+ unless a platform-specific section above states a stricter requirement. Platform SDKs, credentials, entitlements, physical hardware, and store configuration remain application responsibilities.
 
 - [PAM documentation](https://push-in.github.io/pam-docs/introduction/)
 - [PAM Native overview](https://push-in.github.io/pam-docs/native/overview/)

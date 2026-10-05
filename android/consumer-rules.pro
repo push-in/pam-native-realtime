@@ -1,0 +1,1 @@
+-keep class dev.pam.realtime.RealtimeModule { <init>(android.content.Context); }

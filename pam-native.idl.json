@@ -1,1 +1,19 @@
-{"$schema":"vendor/pushinbr/pam-native-plugin-kit/resources/pam-native.idl.schema.json","version":1,"namespace":"Pam.Realtime","enums":{"RealtimeEventKind":{"Connected":1,"Text":2,"Binary":3,"Closed":4,"Failure":5,"Pong":6,"Timeout":7},"RealtimeConnectionState":{"Connecting":1,"Open":2,"Closing":3,"Closed":4,"Failed":5}},"records":{"RealtimeEvent":{"kind":"RealtimeEventKind","payload":"string","code":"int"}}}
+{
+  "$schema": "vendor/pushinbr/pam-native-plugin-kit/resources/pam-native.idl.schema.json",
+  "version": 1,
+  "namespace": "Pam.Realtime",
+  "enums": {
+    "RealtimeEventKind": {"Connected": 1, "Text": 2, "Binary": 3, "Closed": 4, "Failure": 5, "Pong": 6, "Timeout": 7},
+    "RealtimeConnectionState": {"Connecting": 1, "Open": 2, "Closing": 3, "Closed": 4, "Failed": 5},
+    "ConnectionState": {"Connecting": 1, "Connected": 2, "Unavailable": 3, "Disconnected": 4, "Failed": 5},
+    "ChannelType": {"Public": 1, "Private": 2, "Presence": 3},
+    "FrameKind": {"State": 1, "Message": 2, "Whisper": 3, "Subscribed": 4, "SubscriptionFailed": 5, "MemberAdded": 6, "MemberRemoved": 7}
+  },
+  "records": {
+    "RealtimeEvent": {"kind": "RealtimeEventKind", "payload": "string", "code": "int"},
+    "RealtimeMessage": {"channel": "string", "event": "string", "raw": "string", "userId": "string?", "whisper": "bool"},
+    "PresenceMember": {"id": "string"},
+    "SubscriptionError": {"channel": "string", "status": "int", "message": "string", "retryInMillis": "int"},
+    "RealtimeStatus": {"state": "ConnectionState", "socketId": "string?", "reason": "string", "attempt": "int", "retryInMillis": "int"}
+  }
+}
