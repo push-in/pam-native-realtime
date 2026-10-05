@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 - 2026-10-05
+
+### Added
+
+- iOS Pusher protocol 7 client (Pusher Channels, Laravel Reverb, Soketi) over
+  `URLSessionWebSocketTask`: public/private/presence channels with auth,
+  jittered reconnect backoff, Pusher error codes, heartbeat/pong timeout,
+  handshake timeout, `NWPathMonitor` network recovery, re-subscription,
+  coalesced batch delivery (`pusherNext`), whisper throttling, `token()`,
+  `reconnect()` and status snapshots — the same contract as Android.
+- XCTest mirror with a Network.framework Pusher server (`ios/Tests`).
+  Uncompiled on the release machine; needs device validation.
+
 ## 0.3.0 - 2026-10-05
 
 ### Breaking

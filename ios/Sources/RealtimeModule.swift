@@ -4,14 +4,44 @@ import PamNative
 public final class RealtimeModule:NativeModule,ClosableNativeModule,@unchecked Sendable{
     private let lock=NSLock();private var connections:[String:RealtimeConnection]=[:]
     public init(){}
-    public func invoke(method:String,payload:Data,completion:@escaping ModuleCompletion){do{let v=try WireMap.decode(payload);switch method{
+    private var pusher:[String:PusherClient]=[:]
+    public func invoke(method:String,payload:Data,completion:@escaping ModuleCompletion){if method.hasPrefix("pusher"){pusherInvoke(method,payload,completion);return};do{let v=try WireMap.decode(payload);switch method{
     case "connect":guard case let .text(urlText)?=v["url"],case let .text(headersJson)?=v["headers"],case let .text(protocolsText)?=v["protocols"],case let .integer(maxBytes)?=v["maxMessageBytes"],let url=URL(string:urlText)else{throw RealtimeError.invalidRequest};var request=URLRequest(url:url);if let data=headersJson.data(using:.utf8),let headers=try JSONSerialization.jsonObject(with:data)as?[String:String]{headers.forEach{request.setValue($1,forHTTPHeaderField:$0)}};if !protocolsText.isEmpty{request.setValue(protocolsText,forHTTPHeaderField:"Sec-WebSocket-Protocol")};let id=UUID().uuidString;let connection=RealtimeConnection(id:id,request:request,maxBytes:Int(maxBytes)){[weak self] id in self?.remove(id)};lock.pamLocked{connections[id]=connection};connection.start();succeed(["identifier":.text(id)],completion)
     case "send":let c=try connection(v);guard case let .text(payload)?=v["payload"],case let .flag(binary)?=v["binary"]else{throw RealtimeError.invalidRequest};c.send(payload:payload,binary:binary){error in if let error{completion(.failure,Data(error.localizedDescription.utf8))}else{self.succeed([:],completion)}}
     case "poll":let c=try connection(v);guard case let .integer(timeout)?=v["timeoutMillis"]else{throw RealtimeError.invalidRequest};try c.poll(timeoutMillis:Int(timeout),completion:completion)
     case "state":succeed(["state":.integer(Int64(try connection(v).state))],completion)
     case "close":let c=try connection(v);guard case let .integer(code)?=v["code"],case let .text(reason)?=v["reason"]else{throw RealtimeError.invalidRequest};c.close(code:Int(code),reason:reason);succeed([:],completion)
     default:throw RealtimeError.invalidRequest}}catch{completion(.failure,Data(String(describing:error).utf8))}}
-    public func close(){let all=lock.pamLocked{let value=Array(connections.values);connections.removeAll();return value};all.forEach{$0.close(code:1001,reason:"Runtime closed")}}
+    public func close(){let all=lock.pamLocked{let value=Array(connections.values);connections.removeAll();return value};all.forEach{$0.close(code:1001,reason:"Runtime closed")};let clients=lock.pamLocked{let value=Array(pusher.values);pusher.removeAll();return value};clients.forEach{$0.close()}}
+
+    /// Pusher protocol (Laravel Echo / Reverb / Soketi) clients with native batching.
+    private func pusherInvoke(_ method:String,_ payload:Data,_ completion:@escaping ModuleCompletion){
+        do{
+            let v=try WireMap.decode(payload)
+            guard case let .text(id)?=v["client"] else{throw RealtimeError.invalidRequest}
+            func text(_ key:String)throws->String{guard case let .text(value)?=v[key] else{throw RealtimeError.invalidRequest};return value}
+            if method=="pusherConnect"{
+                let client=PusherClient(id:id,config:try PusherConfig(try text("config")))
+                let previous=lock.pamLocked{()->PusherClient? in let old=pusher[id];pusher[id]=client;return old}
+                previous?.close()
+                client.start()
+                succeed([:],completion)
+                return
+            }
+            guard let target=lock.pamLocked({pusher[id]}) else{completion(.failure,Data("Unknown realtime client \(id)".utf8));return}
+            switch method{
+            case "pusherNext":target.events.next(completion)
+            case "pusherSubscribe":target.subscribe(try text("channel"));succeed([:],completion)
+            case "pusherUnsubscribe":target.unsubscribe(try text("channel"));succeed([:],completion)
+            case "pusherWhisper":target.whisper(try text("channel"),event:try text("event"),data:try text("data"),completion:completion)
+            case "pusherToken":let bearer=try text("bearer");target.token(bearer.isEmpty ? nil : bearer);succeed([:],completion)
+            case "pusherReconnect":target.reconnect();succeed([:],completion)
+            case "pusherStatus":target.status(completion)
+            case "pusherDisconnect":lock.pamLocked{if pusher[id]===target{pusher[id]=nil}};target.close();succeed([:],completion)
+            default:completion(.failure,Data("Unknown method: \(method)".utf8))
+            }
+        }catch{completion(.failure,Data(((error as? LocalizedError)?.errorDescription ?? String(describing:error)).utf8))}
+    }
     private func connection(_ v:[String:WireValue])throws->RealtimeConnection{guard case let .text(id)?=v["identifier"],let c=lock.pamLocked({connections[id]})else{throw RealtimeError.unknownConnection};return c}
     private func remove(_ id:String){lock.pamLocked{connections.removeValue(forKey:id)}}
     private func succeed(_ values:[String:WireValue],_ completion:ModuleCompletion){do{completion(.success,try WireMap.encode(values))}catch{completion(.failure,Data(String(describing:error).utf8))}}

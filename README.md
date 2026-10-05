@@ -143,8 +143,11 @@ Laravel Echo.
 
 ## Platform support
 
-Android API 26+ (OkHttp `5.3.0`). On iOS 15+ only `RealtimeSocket` is
-available in this release; the Pusher channel methods report a module failure.
+Android API 26+ (OkHttp `5.3.0`) and iOS 15+ (`URLSessionWebSocketTask`,
+`NWPathMonitor` for network-change recovery): the Pusher client, batching,
+backoff, liveness, channel authorization and whisper throttling behave the
+same on both platforms. The iOS implementation has not been validated on a
+device yet; see `ios/Tests/PusherTests.swift`.
 PAM Native `>=1.0.35 <2.0.0`. End-to-end encrypted channels
 (`private-encrypted-*`) are rejected.
 
