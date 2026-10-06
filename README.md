@@ -119,27 +119,163 @@ replaces the native client.
 
 ## What installation does
 
-`pam add realtime` resolves the official compatible package, performs a non-mutating Composer preflight, updates the normal `composer.json` and `composer.lock`, refreshes generated native integration when required, and leaves the project ready for `pam doctor` validation.
+`pam add realtime` (or `pam composer require pushinbr/pam-native-realtime` followed by `pam doctor --fix`) resolves the official compatible package, performs a non-mutating Composer preflight, updates the normal `composer.json` and `composer.lock`, refreshes generated native integration when required, and leaves the project ready for `pam doctor` validation. The package is a PAM Native plugin (module `realtime`); nothing is added to `pam-native.json`.
 
 Use `pam packages` to inspect availability and `pam remove realtime` to uninstall the capability safely. Direct Composer commands are an advanced interoperability path; PAM is the supported application workflow.
 
-## API guide
+- **Android:** merged permissions `INTERNET` and `ACCESS_NETWORK_STATE`
+  (network-change recovery); dependency `com.squareup.okhttp3:okhttp:5.3.0`.
+  No runtime permission.
+- **iOS:** framework `Network` (`NWPathMonitor`); no Info.plist keys. The
+  socket does not run while iOS suspends the app; once the app runs again the
+  liveness checks reconnect and re-subscribe (call `Realtime::reconnect()` on
+  `AppState::Active` to skip a pending backoff, as Zé Chat does).
 
-| API | Responsibility |
+## A real example: Zé Chat
+
+Zé Chat talks to Laravel Reverb. One connection is opened lazily by the first
+screen that subscribes; screens register handlers per channel, the bearer is
+refreshed in place, and a socket waiting for its backoff reconnects as soon as
+the app is active again:
+
+```php
+use Pam\Native\{App, AppState};
+use Pam\Native\Realtime\{Channel, ConnectionState, PresenceChannel, PresenceMember, Realtime, RealtimeMessage, RealtimeStatus, Secret};
+
+private static function connect(string $token): void
+{
+    if (Realtime::has()) {
+        if (self::$token !== $token) {
+            self::$token = $token;
+            Realtime::token(Secret::value($token));          // rejected (401/403) channels retry at once
+        }
+        return;
+    }
+    self::$token = $token;
+    Realtime::pusher('wss://api.example.com/app/app-key?protocol=7&client=zechat&version=1.0.0')
+        ->auth('https://api.example.com/api/broadcasting/auth', Secret::value($token))
+        ->header('Origin', 'https://api.example.com')
+        ->terminalRetry(300)                                  // Reverb 4009: retry after 5 minutes, never give up
+        ->onState(fn (RealtimeStatus $s) => self::broadcastState($s->state))
+        ->connect();
+
+    App::onStateChange(function (AppState $state): void {
+        if ($state === AppState::Active && Realtime::state() === ConnectionState::Unavailable) {
+            Realtime::reconnect();                            // skip the pending backoff
+        }
+    });
+}
+
+private static function listen(string $name): Channel
+{
+    $channel = Realtime::channel($name);                      // private-…/presence-… prefixes pick the type
+    $channel->listenToAll(fn (RealtimeMessage $m) => self::dispatch($name, $m->event, $m->data, $m->userId));
+    if ($channel instanceof PresenceChannel) {
+        $channel
+            ->here(fn (array $members) => self::online($name, array_map(fn (PresenceMember $m) => $m->id, $members)))
+            ->joining(fn (PresenceMember $m) => self::joined($name, $m->id, $m->info))
+            ->leaving(fn (PresenceMember $m) => self::left($name, $m->id));
+    }
+    return $channel;
+}
+
+// Typing indicator: client events are throttled natively (100 ms per event).
+self::$channels["presence-chat.{$chatId}"]->whisper('client-typing', ['typing' => true]);
+
+// Support screen.
+Realtime::status(fn (RealtimeStatus $s) => $this->diagnostics = $s->journal);
+```
+
+A runnable minimal app is in [`example/`](example).
+
+## API reference
+
+All classes live in `Pam\Native\Realtime`.
+
+### `Realtime` (static facade over the `default` connection)
+
+| Method | Description |
 | --- | --- |
-| `Realtime` | Static facade: `pusher()`, `reverb()`, `channel()`, `private()`, `join()`, `presence()`, `leave()`, `token()`, `reconnect()`, `socketId()`, `state()`, `status()`, `disconnect()`, `connection($name)`. |
-| `PusherConnector` | `auth()`, `bearer()`, `header()`, `backoff()`, `heartbeat()`, `handshakeTimeout()`, `terminalRetry()`, `coalesce()`, `buffer()`, `namespace()`, `onState()`, `onConnected()`, `onDropped()`, `connect()`. |
-| `RealtimeConnection` | The live connection behind the facade (several named connections are supported). |
-| `Channel` / `PresenceChannel` | `listen()`, `listenForWhisper()`, `listenToAll()`, `stopListening()`, `whisper()`, `subscribed()`, `error()`, `leave()`; presence adds `here()`, `joining()`, `leaving()`, `members()`. |
-| `RealtimeMessage`, `PresenceMember`, `SubscriptionError`, `RealtimeStatus` | Typed payloads. `RealtimeMessage::$data` is the decoded JSON payload. |
-| `ConnectionState`, `ChannelType` | Sequential int-backed enums. |
-| `Secret` | Redacted bearer value (kept in memory only, never in snapshots). |
-| `RealtimeSocket` | Low-level raw RFC 6455 socket (text/binary frames, long-poll reads) for non-Pusher protocols. |
+| `pusher(string $url, ?string $key = null): PusherConnector` | Pusher protocol 7 client; `$url` must be `wss://`. With `$key`, `/app/<key>?protocol=7&client=pam-native…` is appended; without it, pass the full Pusher URL. |
+| `reverb(string $host, string $key, int $port = 443): PusherConnector` | `wss://host[:port]` for Laravel Reverb. |
+| `connection(string $name = 'default'): RealtimeConnection`, `has(string $name = 'default'): bool` | Named connections. `connection()` throws `LogicException` before `connect()`. |
+| `channel(string $name): Channel` | Public, or private/presence when the name has the `private-`/`presence-` prefix. |
+| `private(string $name): Channel`, `join(string $name)`/`presence(string $name): PresenceChannel` | Echo-style helpers that add the prefix. |
+| `leave(string $name): void` | Leaves the public, `private-` and `presence-` variants. |
+| `token(string\|Secret\|null $bearer): void` | New bearer for channel auth. |
+| `reconnect(): void`, `disconnect(string $name = 'default'): void` | Lifecycle. |
+| `socketId(): ?string`, `state(): ConnectionState` | Last pushed values (no native round trip). |
+| `status(Closure(RealtimeStatus) $then): int` | Native snapshot with channels and the 40-entry journal. |
 
-Event names: leading dots are ignored, so `listen('message.sent')` matches a
-`broadcastAs()` name sent as `message.sent` or `.message.sent`. With
-`->namespace('App\Events')`, names without a leading dot are prefixed like
-Laravel Echo.
+### `PusherConnector`
+
+`auth(string $endpoint, string|Secret|null $bearer = null, array $headers = [])`
+(HTTPS endpoint), `bearer()`, `header(string $name, string $value)`,
+`backoff(int $initialMillis = 400, int $maxMillis = 15_000, float $multiplier = 1.8)`,
+`heartbeat(int $activitySeconds = 30, int $pongSeconds = 12)`,
+`handshakeTimeout(int $seconds = 10)`, `terminalRetry(int $seconds = 300)`,
+`coalesce(int $quietMillis = 32, int $maxMillis = 150)`,
+`buffer(int $capacity = 2_048, int $maxBatch = 512)`,
+`namespace(?string $namespace)`, `onState(Closure(RealtimeStatus))`,
+`onConnected(Closure(RealtimeStatus))` (every new session),
+`onDropped(Closure(int))`, `connect(string $name = 'default'): RealtimeConnection`,
+`configuration()`. `__debugInfo()` redacts the bearer.
+
+### `RealtimeConnection`
+
+Same operations as the facade for one named connection: `channel()`,
+`private()`, `join()`, `presence()`, `leave()`, `channels()`, `token()`,
+`reconnect()`, `status()`, `current(): RealtimeStatus`, `state()`,
+`socketId()`, `onState()`, `onConnected()`, `onDropped()`, `disconnect()`,
+`closed()`, readonly `name`.
+
+### `Channel` / `PresenceChannel`
+
+`Channel` (readonly `name`, `type`): `listen(string $event, Closure(RealtimeMessage))`,
+`listenToAll(Closure(RealtimeMessage))` (whispers included),
+`listenForWhisper(string $event, Closure(RealtimeMessage))`,
+`stopListening(string $event, ?Closure $callback = null)`,
+`stopListeningForWhisper()`, `whisper(string $event, array $data = [])`
+(private/presence only, ≤ 10 KiB, sent as `client-<event>` unless already
+prefixed), `subscribed(Closure())` (every (re)subscription; immediately when
+already subscribed), `error(Closure(SubscriptionError))`, `isSubscribed()`,
+`leave()`. `PresenceChannel` adds `here(Closure(list<PresenceMember>))`,
+`joining(Closure(PresenceMember))`, `leaving(Closure(PresenceMember))`,
+`members()`, `member(string $id): ?PresenceMember`, `count()`.
+
+### Values and enums
+
+| Type | Members |
+| --- | --- |
+| `RealtimeMessage` | `channel`, `event`, `raw`, `data` (decoded JSON), `userId`, `whisper`; `get(string $key, $default = null)`, `json(): array` |
+| `PresenceMember` | `id`, `info`; `get()` |
+| `SubscriptionError` | `channel`, `status` (HTTP), `message`, `retryInMillis`; `forbidden()` (401/403) |
+| `RealtimeStatus` | `state`, `socketId`, `reason`, `attempt`, `retryInMillis`, `lastError`, `connectedAt`, `pending`, `channels`, `journal`; `connected()` |
+| `Secret` | `value(string)`, `reveal()`; redacted in dumps |
+| `ConnectionState` | `Connecting = 1`, `Connected`, `Unavailable`, `Disconnected`, `Failed = 5`; `connected()` |
+| `ChannelType` | `Public = 1`, `Private`, `Presence`; `of(string)`, `allowsWhispers()` |
+
+### `RealtimeSocket` (raw RFC 6455)
+
+`connect(string $url, array $headers, array $protocols, Closure(?string $id, ?string $error) $complete, int $maxMessageBytes = 1_048_576)`,
+`sendText()`, `sendBinary()` (`Closure(bool, ?string)`),
+`poll(string $id, Closure(?RealtimeEvent, ?string), int $timeoutMillis = 25_000)`,
+`state(string $id, Closure(RealtimeConnectionState))`,
+`close(string $id, Closure(bool), int $code = 1000, string $reason = '')`.
+`RealtimeEvent` carries `RealtimeEventKind` (`Connected = 1`, `Text`, `Binary`,
+`Closed`, `Failure`, `Pong`, `Timeout = 7`), `payload` and `code`;
+`RealtimeConnectionState` is `Connecting = 1`, `Open`, `Closing`, `Closed`,
+`Failed = 5`.
+
+### Errors
+
+`InvalidArgumentException`: non-`wss://` URLs, a non-HTTPS auth endpoint,
+invalid keys, hosts, ports, header names/values, connection or channel names,
+`private-encrypted-*` channels, out-of-range tuning values, event names over
+200 bytes, whispers over 10 KiB. `LogicException`: whispers on public channels,
+operations on a closed connection, using the facade before `connect()`.
+Network and auth failures never throw: they arrive as `ConnectionState`
+changes, `SubscriptionError`s and the status journal.
 
 ## Platform support
 
@@ -167,6 +303,11 @@ cd android && ANDROID_SERIAL=emulator-5558 \
 - Run `pam doctor`, `pam test`, and a signed release build on every supported platform.
 
 ## Compatibility and support
+
+| `pushinbr/pam-native-realtime` | `pushinbr/pam-native` | Android | iOS |
+| --- | --- | --- | --- |
+| 0.4.x | `>=1.0.35 <2.0.0` (tested with 1.14.x) | API 26+ | 15+ (Pusher client) |
+| 0.3.x | `>=1.0.35 <2.0.0` | API 26+ | Raw socket only |
 
 - [PAM documentation](https://push-in.github.io/pam-docs/introduction/)
 - [PAM Native overview](https://push-in.github.io/pam-docs/native/overview/)
