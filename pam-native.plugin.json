@@ -6,7 +6,7 @@
   "php": {"provider": "Pam\\Native\\Realtime\\RealtimePluginProvider"},
   "android": {
     "namespace": "dev.pam.realtime",
-    "minSdk": 26,
+    "minSdk": 24,
     "permissions": ["android.permission.ACCESS_NETWORK_STATE", "android.permission.INTERNET"],
     "manifest": "android/src/main/AndroidManifest.xml",
     "consumerRules": "android/consumer-rules.pro",

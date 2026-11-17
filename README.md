@@ -74,7 +74,7 @@ The socket, the Pusher protocol, channel auth, heartbeats, reconnects and re-sub
 
 | Platform | Support | Notes |
 | --- | --- | --- |
-| Android | API 26+ | OkHttp 5.3.0 |
+| Android | API 24+ | OkHttp 5.3.0 |
 | iOS | 15.0+ | `URLSessionWebSocketTask`, `NWPathMonitor`; not validated on a device yet (see `ios/Tests/PusherTests.swift`) |
 | PAM Native | 1.0.35 to < 2.0.0 | From `pam-native.plugin.json`; PHP 8.5+ |
 
