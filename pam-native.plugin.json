@@ -2,7 +2,7 @@
   "$schema": "vendor/pushinbr/pam-native/resources/pam-native.plugin.schema.json",
   "version": 1,
   "protocol": 1,
-  "pamNative": {"minimum": "1.0.35", "maximumExclusive": "2.0.0"},
+  "pamNative": {"minimum": "1.53.1", "maximumExclusive": "2.0.0"},
   "php": {"provider": "Pam\\Native\\Realtime\\RealtimePluginProvider"},
   "android": {
     "namespace": "dev.pam.realtime",
