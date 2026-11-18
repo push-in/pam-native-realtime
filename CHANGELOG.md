@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 - 2026-11-18
 
 - Android: a recreated Activity no longer leaves the app without realtime. PAM Native retires the previous surface's module registry while the PHP runtime keeps running, and `RealtimeModule` closed every Pusher client and WebSocket there: PHP kept a stale `Connected` state, later calls hit a module with no client and nothing reconnected until the process was restarted. `RealtimeModule` is now a `SurfaceRetirableModule` that hands its live clients and sockets to the module replacing it (the read PHP left pending still completes).
 - A failed native read (the client was closed or is unknown) no longer stops delivery silently: the connection opens the native client again once, with every channel and the latest bearer, reports `Disconnected` if that fails too, and `reconnect()` reopens a lost client.
