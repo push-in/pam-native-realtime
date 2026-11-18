@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import PamNative
+import UIKit
 
 /// Configuration decoded from the PHP `PusherConnector`.
 final class PusherConfig: @unchecked Sendable {
@@ -20,6 +21,12 @@ final class PusherConfig: @unchecked Sendable {
     let maxDelayMs: Int64
     let capacity: Int
     let maxBatch: Int
+    /// Channel auth request timeout.
+    let authTimeoutMs: Int64
+    /// Back in the foreground after this much silence, the socket is probed...
+    let wakeProbeAfterMs: Int64
+    /// ...and dropped (reconnect) when no frame answers within this time.
+    let wakeProbeTimeoutMs: Int64
 
     init(_ json: String) throws {
         guard let object = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
@@ -49,6 +56,9 @@ final class PusherConfig: @unchecked Sendable {
         maxDelayMs = long("maxDelayMs", 150, 0...5_000)
         capacity = Int(long("capacity", 2_048, 16...65_536))
         maxBatch = Int(long("maxBatch", 512, 1...8_192))
+        authTimeoutMs = long("authTimeoutMs", 8_000, 250...60_000)
+        wakeProbeAfterMs = long("wakeProbeAfterMs", 30_000, 0...600_000)
+        wakeProbeTimeoutMs = long("wakeProbeTimeoutMs", 5_000, 250...120_000)
     }
 }
 
@@ -120,6 +130,9 @@ final class PusherClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     private var activityTimeoutMs: Int64
     private var lastFrameAt: Int64 = 0
     private var pingSentAt: Int64 = 0
+    /// Pong deadline of the ping in flight: `pongTimeoutMs`, or shorter for a wake probe.
+    private var pongTimeoutMs: Int64 = 0
+    private var foregroundObserver: NSObjectProtocol?
     private var connectedAt: Int64 = 0
     private var lastError = ""
     private var reconnectTask: DispatchWorkItem?
@@ -149,8 +162,31 @@ final class PusherClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     func start() {
         queue.async {
             self.startNetworkMonitor()
+            self.foregroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil
+            ) { [weak self] _ in self?.wake() }
             self.openSocket("connect")
         }
+    }
+
+    /// The app became active. A socket silent for a while may be dead on the
+    /// server side while it still reads Connected here: ping it now with a
+    /// short deadline instead of waiting for the next liveness tick.
+    func wake() {
+        queue.async {
+            guard Self.wakeProbes(
+                connected: self.state == Self.stateConnected && !self.closed,
+                silentMs: self.now() - self.lastFrameAt,
+                afterMs: self.config.wakeProbeAfterMs
+            ) else { return }
+            self.probe(timeoutMs: self.config.wakeProbeTimeoutMs)
+            self.queue.asyncAfter(deadline: .now() + .milliseconds(Int(self.config.wakeProbeTimeoutMs))) { self.checkLiveness() }
+        }
+    }
+
+    /// Wake probe rule, shared with Android.
+    static func wakeProbes(connected: Bool, silentMs: Int64, afterMs: Int64) -> Bool {
+        connected && silentMs >= afterMs
     }
 
     func subscribe(_ name: String) {
@@ -246,6 +282,8 @@ final class PusherClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         queue.async {
             guard !self.closed else { return }
             self.closed = true
+            if let observer = self.foregroundObserver { NotificationCenter.default.removeObserver(observer) }
+            self.foregroundObserver = nil
             self.monitor?.cancel()
             self.monitor = nil
             self.reconnectTask?.cancel()
@@ -521,7 +559,7 @@ final class PusherClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         }
         channel.authorizing = true
         let owner = generation
-        var request = URLRequest(url: endpoint, timeoutInterval: 15)
+        var request = URLRequest(url: endpoint, timeoutInterval: Double(config.authTimeoutMs) / 1_000)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -591,15 +629,22 @@ final class PusherClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     private func checkLiveness() {
         guard state == Self.stateConnected, !closed else { return }
         let now = now()
-        if pingSentAt > 0 && now - pingSentAt >= config.pongTimeoutMs {
+        if pingSentAt > 0 && now - pingSentAt >= pongTimeoutMs {
             lost(generation, "Pong timeout")
         } else if pingSentAt == 0 && now - lastFrameAt >= activityTimeoutMs {
             probe()
         }
     }
 
-    private func probe() {
-        guard state == Self.stateConnected, pingSentAt == 0 else { return }
+    private func probe(timeoutMs: Int64? = nil) {
+        guard state == Self.stateConnected else { return }
+        let deadline = timeoutMs ?? config.pongTimeoutMs
+        if pingSentAt > 0 {
+            // A ping is already out: only tighten its deadline.
+            pongTimeoutMs = min(pongTimeoutMs, deadline)
+            return
+        }
+        pongTimeoutMs = deadline
         pingSentAt = now()
         send(["event": "pusher:ping", "data": [String: Any]()])
     }
@@ -663,7 +708,8 @@ final class PusherClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         socket.send(.string(String(decoding: data, as: UTF8.self))) { _ in }
     }
 
-    private func now() -> Int64 { Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000) }
+    /// Counts sleep (CLOCK_MONOTONIC on Darwin), unlike DispatchTime's uptime clock.
+    private func now() -> Int64 { Int64(clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1_000_000) }
 
     static func objectData(_ message: [String: Any]) -> [String: Any] {
         switch message["data"] {

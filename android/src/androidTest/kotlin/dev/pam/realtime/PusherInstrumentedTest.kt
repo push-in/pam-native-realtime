@@ -2,6 +2,7 @@ package dev.pam.realtime
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.pam.nativeapp.HostEvents
 import dev.pam.nativeapp.modules.ModuleCompletion
 import dev.pam.nativeapp.modules.ModuleResultStatus
 import dev.pam.nativeapp.protocol.WireMap
@@ -38,6 +39,8 @@ class PusherInstrumentedTest {
     private val authBodies = CopyOnWriteArrayList<String>()
     private val connections = AtomicInteger()
     @Volatile private var authStatus = 200
+    @Volatile private var authDelaysLeft = 0
+    @Volatile private var answerPings = true
 
     private data class Result(val ok: Boolean, val values: Map<String, WireValue>, val message: String)
 
@@ -53,7 +56,12 @@ class PusherInstrumentedTest {
                     val channel = Regex("channel_name=([^&]+)").find(body)!!.groupValues[1].replace("%2D", "-")
                     val auth = JSONObject().put("auth", "test-key:signature")
                     if (channel.startsWith("presence")) auth.put("channel_data", JSONObject().put("user_id", "7").put("user_info", JSONObject().put("name", "Ana")).toString())
-                    MockResponse().setResponseCode(authStatus).setBody(if (authStatus == 200) auth.toString() else "{}")
+                    MockResponse().setResponseCode(authStatus).setBody(if (authStatus == 200) auth.toString() else "{}").apply {
+                        if (authDelaysLeft > 0) {
+                            authDelaysLeft--
+                            setHeadersDelay(20, TimeUnit.SECONDS)
+                        }
+                    }
                 }
                 else -> MockResponse().setResponseCode(404)
             }
@@ -87,7 +95,7 @@ class PusherInstrumentedTest {
                 } else "{}"
                 webSocket.send(frame("pusher_internal:subscription_succeeded", channel, data))
             }
-            if (message.getString("event") == "pusher:ping") webSocket.send(frame("pusher:pong", null, "{}"))
+            if (message.getString("event") == "pusher:ping" && answerPings) webSocket.send(frame("pusher:pong", null, "{}"))
         }
     }
 
@@ -245,6 +253,42 @@ class PusherInstrumentedTest {
         pusher("pusherToken", "bearer" to WireValue.Text("token-2"))
         until(subscribed("private-chat.99"))
         assertEquals("Bearer token-2", authRequests.last().getHeader("Authorization"))
+    }
+
+    @Test
+    fun aHangingChannelAuthTimesOutAndRetries() {
+        authDelaysLeft = 1
+        connect { put("authTimeoutMs", 500) }
+        pusher("pusherSubscribe", "channel" to WireValue.Text("private-chat.7"))
+        val events = until(subscribed("private-chat.7"))
+        val failure = events.first { it.getInt("k") == 5 }
+        assertEquals(0, failure.getInt("h"))
+        assertTrue(failure.getLong("w") in 1..8_000)
+        assertEquals(2, authRequests.size)
+    }
+
+    @Test
+    fun comingBackToTheForegroundProbesASilentSocketAndReconnectsWhenItIsDead() {
+        connect {
+            put("wakeProbeAfterMs", 0)
+            put("wakeProbeTimeoutMs", 500)
+        }
+        until(::connected)
+        // Alive: the probe is answered and the connection stays.
+        HostEvents.foreground(true)
+        waitFor { inbound.count { it.getString("event") == "pusher:ping" } == 1 }
+        Thread.sleep(800)
+        assertEquals(1, connections.get())
+        // Dead on the server side: no answer within the wake deadline, so it reconnects.
+        answerPings = false
+        HostEvents.foreground(true)
+        val dropped = until { it.getInt("k") == 1 && it.getInt("s") == 3 }.last { it.getInt("k") == 1 }
+        assertEquals("Pong timeout", dropped.getString("r"))
+        answerPings = true
+        until(::connected)
+        assertEquals(2, connections.get())
+        // Background transitions never probe.
+        HostEvents.foreground(false)
     }
 
     @Test

@@ -25,12 +25,21 @@ like `Sensors::watch()`.
   immediately for 4200-4299, after backoff for 4100-4199.
 - `pusher:ping` after `activity_timeout` of silence (server value or
   `->heartbeat()`), reconnect when nothing answers in 12 s; a handshake that
-  does not finish in 10 s is retried.
+  does not finish in 10 s is retried. Silence is measured on a clock that
+  keeps counting while the device sleeps (Android `elapsedRealtime`, iOS
+  `CLOCK_MONOTONIC`), so the first liveness check after Doze sees it.
+- Back in the foreground, a `Connected` socket that has been silent for 30 s
+  or more is pinged at once and dropped (reconnect) when nothing answers in
+  5 s: a socket the server closed while the device slept no longer looks alive
+  until the next liveness check. Android uses the host foreground event, iOS
+  `didBecomeActive`; nothing runs in the background.
 - Network callbacks: when connectivity returns, a pending backoff is skipped;
   when the default network changes, the socket is probed.
 - Every channel is re-authorized and re-subscribed after each reconnect.
   Auth failures retry with backoff (350 ms – 8 s), `401`/`403` after 60 s or
-  right after `Realtime::token()`.
+  right after `Realtime::token()`. The auth request times out after 8 s (10 s
+  for the whole call on Android) and retries like any other failure, so a
+  slow API never leaves a channel unsubscribed while the socket is up.
 - Outbound whispers are throttled natively to one frame per 100 ms per event
   (the newest payload wins), within the Pusher client-event limit.
 - `Realtime::status(fn (RealtimeStatus $s) => ...)` returns the state, socket id,

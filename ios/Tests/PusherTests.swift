@@ -88,6 +88,16 @@ final class PusherTests: XCTestCase {
         XCTAssertEqual(call("pusherWhisper", ["client": .text("c1"), "channel": .text("private-room"), "event": .text("client-typing"), "data": .text("{}")])["sent"], .flag(false))
     }
 
+    func testWakeProbesOnlyAConnectedSocketThatStayedSilent() throws {
+        XCTAssertTrue(PusherClient.wakeProbes(connected: true, silentMs: 30_000, afterMs: 30_000))
+        XCTAssertFalse(PusherClient.wakeProbes(connected: true, silentMs: 29_999, afterMs: 30_000))
+        XCTAssertFalse(PusherClient.wakeProbes(connected: false, silentMs: 90_000, afterMs: 30_000))
+        let config = try PusherConfig(#"{"url":"wss://example.com/app/k"}"#)
+        XCTAssertEqual(config.authTimeoutMs, 8_000)
+        XCTAssertEqual(config.wakeProbeAfterMs, 30_000)
+        XCTAssertEqual(config.wakeProbeTimeoutMs, 5_000)
+    }
+
     func testBatcherCoalescesKeyedEntriesAndReportsDrops() {
         let batcher = EventBatcher(queue: DispatchQueue(label: "t"), quietMillis: 5, maxDelayMillis: 20, capacity: 3, maxBatch: 10)
         batcher.offer("state", ["s": 1])

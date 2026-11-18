@@ -1,6 +1,8 @@
 package dev.pam.realtime
 
 import android.util.Base64
+import dev.pam.nativeapp.HostEventListener
+import dev.pam.nativeapp.HostEvents
 import dev.pam.nativeapp.modules.ModuleCompletion
 import dev.pam.nativeapp.modules.NativeModule
 import dev.pam.nativeapp.modules.SurfaceRetirableModule
@@ -32,7 +34,13 @@ class RealtimeModule(context: android.content.Context) : NativeModule, SurfaceRe
     @Volatile private var sockets=Sockets()
     @Volatile private var retired=false
 
-    init { synchronized(lock){ newest=WeakReference(this) } }
+    init {
+        synchronized(lock){ newest=WeakReference(this) }
+        HostEvents.register(foreground)
+    }
+
+    /** Back in the foreground: Pusher clients probe a socket that stayed silent (it may be dead server-side). */
+    private fun wake(){ if(!retired) sockets.wake() }
 
     override fun invoke(method:String,payload:ByteArray,completion:ModuleCompletion){val s=sockets;if(method.startsWith("pusher")){runCatching{s.pusher(method,WireMap.decode(payload),completion)}.onFailure{completion.failure(it)};return};runCatching{val values=WireMap.decode(payload);when(method){"connect"->s.connect(values);"send"->s.send(values);"poll"->{s.poll(values,completion);return};"state"->s.state(values);"close"->s.close(values);else->error("Unknown method: $method")}}.onSuccess{completion.success(it)}.onFailure{completion.failure(it)}}
 
@@ -57,6 +65,7 @@ class RealtimeModule(context: android.content.Context) : NativeModule, SurfaceRe
     private inner class Sockets {
         private val client=OkHttpClient.Builder().pingInterval(25,TimeUnit.SECONDS).build();private val pusher=ConcurrentHashMap<String,PusherClient>();private val scheduler=Executors.newSingleThreadScheduledExecutor();private val connections=ConcurrentHashMap<String,Connection>()
         fun idle()=pusher.isEmpty()&&connections.isEmpty()
+        fun wake()=pusher.values.forEach{it.wake()}
         fun connect(v:Map<String,WireValue>):Map<String,WireValue>{val id=UUID.randomUUID().toString();val connection=Connection(id,v.integer("maxMessageBytes").toInt());connections[id]=connection;val builder=Request.Builder().url(v.text("url"));val headers=JSONObject(v.text("headers"));headers.keys().forEach{key->builder.header(key,headers.getString(key))};v.text("protocols").takeIf{it.isNotEmpty()}?.let{builder.header("Sec-WebSocket-Protocol",it)};connection.socket=client.newWebSocket(builder.build(),connection);return mapOf("identifier" to WireValue.Text(id))}
         fun send(v:Map<String,WireValue>):Map<String,WireValue>{val c=connection(v);val payload=v.text("payload");val sent=if(v.flag("binary")){val bytes=Base64.decode(payload,Base64.DEFAULT);require(bytes.size<=c.maxMessageBytes){"Message exceeds connection limit"};c.socket?.send(bytes.toByteString())==true}else{require(payload.toByteArray().size<=c.maxMessageBytes){"Message exceeds connection limit"};c.socket?.send(payload)==true};check(sent){"WebSocket rejected message"};return emptyMap()}
         fun poll(v:Map<String,WireValue>,completion:ModuleCompletion){val c=connection(v);val generation:Int;val ready:Event?;synchronized(c){check(c.waiter==null){"Only one poll may be pending per connection"};ready=c.events.removeFirstOrNull();if(ready==null){c.pollGeneration++;generation=c.pollGeneration;c.waiter=completion}else{generation=c.pollGeneration}};if(ready!=null){completion.success(ready.values());if(ready.kind==4||ready.kind==5)connections.remove(c.id,c);return};val timeout=v.integer("timeoutMillis");scheduler.schedule({val waiter=synchronized(c){if(c.pollGeneration!=generation)null else c.waiter.also{c.waiter=null;c.pollGeneration++}};waiter?.success(Event(7).values())},timeout,TimeUnit.MILLISECONDS)}
@@ -106,5 +115,10 @@ class RealtimeModule(context: android.content.Context) : NativeModule, SurfaceRe
         val lock=Any()
         /** The module of the newest registry: the one a retired module hands its sockets to. */
         var newest:WeakReference<RealtimeModule>?=null
+
+        /** Process-wide and registered once (HostEvents keeps listeners for the whole process). */
+        val foreground=object:HostEventListener{
+            override fun foreground(active:Boolean){ if(active) synchronized(lock){ newest?.get() }?.wake() }
+        }
     }
 }

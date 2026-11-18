@@ -3,6 +3,7 @@ package dev.pam.realtime
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
+import android.os.SystemClock
 import dev.pam.nativeapp.modules.ModuleCompletion
 import dev.pam.nativeapp.protocol.WireValue
 import java.io.IOException
@@ -40,6 +41,12 @@ internal class PusherConfig(
     val maxDelayMs: Long,
     val capacity: Int,
     val maxBatch: Int,
+    /** Channel auth POST: read timeout; the whole call gets 2 s more. */
+    val authTimeoutMs: Long = 8_000,
+    /** Back in the foreground after this much silence, the socket is probed... */
+    val wakeProbeAfterMs: Long = 30_000,
+    /** ...and dropped (reconnect) when no frame answers within this time. */
+    val wakeProbeTimeoutMs: Long = 5_000,
 ) {
     companion object {
         fun parse(json: String): PusherConfig {
@@ -63,6 +70,9 @@ internal class PusherConfig(
                 maxDelayMs = o.optLong("maxDelayMs", 150).coerceIn(0, 5_000),
                 capacity = o.optInt("capacity", 2_048).coerceIn(16, 65_536),
                 maxBatch = o.optInt("maxBatch", 512).coerceIn(1, 8_192),
+                authTimeoutMs = o.optLong("authTimeoutMs", 8_000).coerceIn(250, 60_000),
+                wakeProbeAfterMs = o.optLong("wakeProbeAfterMs", 30_000).coerceIn(0, 600_000),
+                wakeProbeTimeoutMs = o.optLong("wakeProbeTimeoutMs", 5_000).coerceIn(250, 120_000),
             )
         }
 
@@ -112,6 +122,17 @@ internal class PusherClient(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .connectTimeout(config.handshakeTimeoutMs, TimeUnit.MILLISECONDS)
         .build()
+
+    /**
+     * Channel auth must not hang: the socket client has no read timeout, and
+     * an unanswered POST (slow API, a proxy holding the request ~100 s) kept
+     * the channel `authorizing`, unsubscribed, while the socket looked fine.
+     * A timeout fails the attempt, which retries with backoff.
+     */
+    private val authHttp = this.http.newBuilder()
+        .readTimeout(config.authTimeoutMs, TimeUnit.MILLISECONDS)
+        .callTimeout(config.authTimeoutMs + 2_000, TimeUnit.MILLISECONDS)
+        .build()
     val events = EventBatcher(executor, config.quietMs, maxOf(config.quietMs, config.maxDelayMs), config.capacity, config.maxBatch)
 
     private val channels = LinkedHashMap<String, ChannelState>()
@@ -129,6 +150,8 @@ internal class PusherClient(
     private var activityTimeoutMs = config.activityTimeoutMs
     private var lastFrameAt = 0L
     private var pingSentAt = 0L
+    /** Pong deadline of the ping in flight: `pongTimeoutMs`, or shorter for a wake probe. */
+    private var pongTimeoutMs = config.pongTimeoutMs
     private var connectedAt = 0L
     private var lastError = ""
     private var reconnectTask: ScheduledFuture<*>? = null
@@ -207,6 +230,19 @@ internal class PusherClient(
         retryNotBefore = 0
         closeSocket(1000, "reconnect")
         openSocket("reconnect")
+    }
+
+    /**
+     * The app came back to the foreground. A socket silent for a while may be
+     * dead on the server side (Doze, a NAT that dropped it) while it still
+     * reads Connected here: ping it now with a short deadline instead of
+     * waiting for the next liveness tick.
+     */
+    fun wake() = post {
+        if (wakeProbes(state == STATE_CONNECTED && !closed, now() - lastFrameAt, config.wakeProbeAfterMs)) {
+            probe(config.wakeProbeTimeoutMs)
+            executor.schedule({ checkLiveness() }, config.wakeProbeTimeoutMs, TimeUnit.MILLISECONDS)
+        }
     }
 
     fun status(completion: ModuleCompletion) = post {
@@ -442,7 +478,7 @@ internal class PusherClient(
             config.authHeaders.forEach { (name, value) -> header(name, value) }
             config.bearer?.let { header("Authorization", "Bearer $it") }
         }.build()
-        http.newCall(request).enqueue(object : Callback {
+        authHttp.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) = post { authorized(channel.name, owner, sid, 0, null, e.message ?: "Auth request failed") }
 
             override fun onResponse(call: Call, response: Response) {
@@ -497,15 +533,21 @@ internal class PusherClient(
     private fun checkLiveness() {
         if (state != STATE_CONNECTED || closed) return
         val now = now()
-        if (pingSentAt > 0 && now - pingSentAt >= config.pongTimeoutMs) {
+        if (pingSentAt > 0 && now - pingSentAt >= pongTimeoutMs) {
             lost(generation, "Pong timeout")
         } else if (pingSentAt == 0L && now - lastFrameAt >= activityTimeoutMs) {
             probe()
         }
     }
 
-    private fun probe() {
-        if (state != STATE_CONNECTED || pingSentAt > 0) return
+    private fun probe(timeoutMs: Long = config.pongTimeoutMs) {
+        if (state != STATE_CONNECTED) return
+        if (pingSentAt > 0) {
+            // A ping is already out: only tighten its deadline.
+            pongTimeoutMs = minOf(pongTimeoutMs, timeoutMs)
+            return
+        }
+        pongTimeoutMs = timeoutMs
         pingSentAt = now()
         send(JSONObject().put("event", "pusher:ping").put("data", JSONObject()))
     }
@@ -591,7 +633,8 @@ internal class PusherClient(
         runCatching { executor.execute { runCatching(block) } }
     }
 
-    private fun now() = System.nanoTime() / 1_000_000
+    /** Counts deep sleep: after Doze the first liveness tick sees the real silence (nanoTime stops while asleep). */
+    private fun now() = SystemClock.elapsedRealtime()
 
     companion object {
         const val STATE_CONNECTING = 1
@@ -613,5 +656,8 @@ internal class PusherClient(
         private const val AUTH_RETRY_MAX_MS = 8_000L
         private const val FORBIDDEN_RETRY_MS = 60_000L
         private const val JOURNAL_SIZE = 40
+
+        /** Wake probe rule, shared with iOS. */
+        fun wakeProbes(connected: Boolean, silentMs: Long, afterMs: Long): Boolean = connected && silentMs >= afterMs
     }
 }
