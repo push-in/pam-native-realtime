@@ -31,6 +31,18 @@ final class RealtimeConnection
 
     private bool $closed = false;
 
+    /** @var array<string, mixed> */
+    private array $configuration = [];
+
+    /** Identifies the pending native read; a replaced read's failure is stale. */
+    private int $read = 0;
+
+    /** The pending native read failed while PHP still wanted the client. */
+    private bool $lost = false;
+
+    /** A lost client was reopened and has not delivered a batch since. */
+    private bool $reopened = false;
+
     /**
      * @internal Use `Realtime::pusher(...)->connect()`.
      * @param list<Closure(RealtimeStatus): void> $onState
@@ -55,6 +67,7 @@ final class RealtimeConnection
         } catch (JsonException $error) {
             throw new InvalidArgumentException('Realtime configuration cannot be encoded.', previous: $error);
         }
+        $this->configuration = $configuration;
         NativeModules::call(self::MODULE, 'pusherConnect', ['client' => $this->name, 'config' => $json], function (NativeModuleResult $result): void {
             if (!$result->succeeded() && !$this->closed) {
                 $this->applyState(new RealtimeStatus(ConnectionState::Failed, reason: $result->message(), lastError: $result->message()));
@@ -134,13 +147,23 @@ final class RealtimeConnection
     {
         $this->assertOpen();
         $value = is_string($bearer) ? Secret::value($bearer)->reveal() : ($bearer?->reveal() ?? '');
+        $this->configuration['bearer'] = $value;
         $this->command('pusherToken', ['bearer' => $value]);
     }
 
-    /** Drops the socket and reconnects now, resetting the backoff (e.g. after the app returns to foreground). */
+    /**
+     * Drops the socket and reconnects now, resetting the backoff (e.g. after
+     * the app returns to foreground). A native client that was lost (its
+     * read failed) is opened again with every channel.
+     */
     public function reconnect(): void
     {
         $this->assertOpen();
+        if ($this->lost) {
+            $this->reopen();
+
+            return;
+        }
         $this->command('pusherReconnect');
     }
 
@@ -260,10 +283,18 @@ final class RealtimeConnection
         if ($this->closed) {
             return;
         }
-        NativeModules::call(self::MODULE, 'pusherNext', ['client' => $this->name], function (NativeModuleResult $result): void {
-            if ($this->closed || !$result->succeeded()) {
+        $read = ++$this->read;
+        $this->lost = false;
+        NativeModules::call(self::MODULE, 'pusherNext', ['client' => $this->name], function (NativeModuleResult $result) use ($read): void {
+            if ($this->closed || $read !== $this->read) {
                 return;
             }
+            if (!$result->succeeded()) {
+                $this->clientLost($result->message());
+
+                return;
+            }
+            $this->reopened = false;
             try {
                 $batch = json_decode((string) ($result->values()['batch'] ?? '{}'), true, 32, JSON_THROW_ON_ERROR);
             } catch (JsonException) {
@@ -273,6 +304,33 @@ final class RealtimeConnection
             $this->next();
             $this->dispatch(is_array($batch) ? $batch : []);
         });
+    }
+
+    /**
+     * The native client went away under a live PHP connection (its module was
+     * replaced or closed): the last pushed state is stale. Open it again once;
+     * if that fails too, report Disconnected and wait for `reconnect()`.
+     */
+    private function clientLost(string $reason): void
+    {
+        $this->lost = true;
+        if (!$this->reopened) {
+            $this->reopen();
+
+            return;
+        }
+        $this->applyState(new RealtimeStatus(ConnectionState::Disconnected, reason: $reason, lastError: $reason));
+    }
+
+    private function reopen(): void
+    {
+        $this->reopened = true;
+        $this->lost = false;
+        $this->applyState(new RealtimeStatus(ConnectionState::Connecting, reason: 'reopen'));
+        $this->open($this->configuration);
+        foreach (array_keys($this->channels) as $name) {
+            $this->command('pusherSubscribe', ['channel' => $name]);
+        }
     }
 
     /** @param array<array-key, mixed> $entry */

@@ -299,6 +299,63 @@ $test('raw socket keeps its typed contract', static function () use ($check): vo
     NativeTestHarness::uninstall();
 });
 
+$test('a lost native client is reopened with its channels and the latest bearer', static function () use ($check, $calls): void {
+    $fake = NativeTestHarness::install();
+    $deferred = static fn (bool $ok, string $payload = ''): Pam\Native\Testing\StubbedModuleResponse => new Pam\Native\Testing\StubbedModuleResponse(
+        $ok ? Pam\Native\ModuleResultStatus::Success : Pam\Native\ModuleResultStatus::Failure,
+        $payload,
+        DispatchMode::Deferred,
+    );
+    for ($i = 0; $i < 4; $i++) {
+        $fake->succeed('realtime', 'pusherConnect');
+        $fake->succeed('realtime', 'pusherSubscribe');
+    }
+    $fake->succeed('realtime', 'pusherToken');
+    $connected = Wire::map(['batch' => json_encode(['events' => [['k' => 1, 's' => 2, 'i' => '2.2']]])]);
+    // Read 1 dies with its module (a recreated Activity); the reopened client delivers, then dies twice.
+    $fake->respond('realtime', 'pusherNext', $deferred(false, 'Realtime client closed'));
+    $fake->respond('realtime', 'pusherNext', $deferred(true, $connected));
+    $fake->respond('realtime', 'pusherNext', $deferred(false, 'Unknown realtime client default'));
+    $fake->respond('realtime', 'pusherNext', $deferred(false, 'Unknown realtime client default'));
+    $fake->respond('realtime', 'pusherNext', $deferred(true, $connected));
+    $fake->respond('realtime', 'pusherNext', $deferred(true, $connected));
+    $fake->succeed('realtime', 'pusherDisconnect');
+    $states = [];
+    Realtime::pusher('wss://ws.example.test', 'key')->auth('https://api.example.test/auth', 'token-1')
+        ->onState(static function (RealtimeStatus $s) use (&$states): void { $states[] = $s->state; })
+        ->connect();
+    $received = [];
+    Realtime::channel('private-chat.42')->listen('message.sent', static function (RealtimeMessage $m) use (&$received): void { $received[] = $m->get('n'); });
+    Realtime::connection()->dispatch(['events' => [['k' => 1, 's' => 2, 'i' => '1.1']]]);
+    Realtime::token('token-2');
+    $check(Realtime::state() === ConnectionState::Connected, 'connected before the loss');
+
+    $fake->flushOne();
+    $connects = $calls($fake, 'pusherConnect');
+    $check(count($connects) === 2 && count($calls($fake, 'pusherNext')) === 2, 'the lost client is opened again with one new read');
+    $config = json_decode(Wire::decodeMap($connects[1]->payload)['config'], true, 8, JSON_THROW_ON_ERROR);
+    $check($config['bearer'] === 'token-2', 'reopened with the refreshed bearer');
+    $check(array_map(static fn ($c) => Wire::decodeMap($c->payload)['channel'], $calls($fake, 'pusherSubscribe')) === ['private-chat.42', 'private-chat.42'], 'channels subscribed again');
+    $check(Realtime::state() === ConnectionState::Connecting, 'stale Connected replaced while reopening');
+
+    $fake->flushOne();
+    $check(Realtime::state() === ConnectionState::Connected && Realtime::socketId() === '2.2', 'reopened client delivers');
+    Realtime::connection()->dispatch(['events' => [['k' => 2, 'c' => 'private-chat.42', 'n' => 'message.sent', 'd' => '{"n":1}']]]);
+    $check($received === [1], 'listeners kept across the reopen');
+
+    $fake->flushOne();
+    $check(count($calls($fake, 'pusherConnect')) === 3, 'a later loss reopens again');
+    $fake->flushOne();
+    $check(count($calls($fake, 'pusherConnect')) === 3 && Realtime::state() === ConnectionState::Disconnected, 'a reopen that fails at once stops and reports Disconnected');
+
+    Realtime::reconnect();
+    $check(count($calls($fake, 'pusherConnect')) === 4 && count($calls($fake, 'pusherSubscribe')) === 4 && $calls($fake, 'pusherReconnect') === [], 'reconnect() reopens a lost client');
+    $fake->flushOne();
+    $check(Realtime::state() === ConnectionState::Connected, 'connected after reconnect()');
+    Realtime::disconnect();
+    NativeTestHarness::uninstall();
+});
+
 $failed = 0;
 foreach ($tests as $name => $body) {
     try {

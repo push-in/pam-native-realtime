@@ -36,5 +36,11 @@ like `Sensors::watch()`.
 - `Realtime::status(fn (RealtimeStatus $s) => ...)` returns the state, socket id,
   channels and a 40-entry diagnostic journal for support screens.
 
+Android keeps the native clients across a recreated Activity (font size,
+display size, language, a task the system trimmed): the retired module hands
+them to the next one. If the native client is ever lost anyway (its pending
+read fails), PHP opens it again with every channel; `reconnect()` does the
+same after a failed reopen.
+
 Hot reload safe: connecting again with the same name (`connect('default')`)
 replaces the native client.

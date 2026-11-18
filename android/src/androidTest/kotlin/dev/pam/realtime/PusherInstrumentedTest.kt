@@ -97,10 +97,10 @@ class PusherInstrumentedTest {
             user?.let { put("user_id", it) }
         }.toString()
 
-    private fun call(method: String, values: Map<String, WireValue>, timeout: Long = 10): Result {
+    private fun call(method: String, values: Map<String, WireValue>, timeout: Long = 10, target: RealtimeModule = module): Result {
         val latch = CountDownLatch(1)
         val result = AtomicReference<Result>()
-        module.invoke(method, WireMap.encode(values), ModuleCompletion { status, payload ->
+        target.invoke(method, WireMap.encode(values), ModuleCompletion { status, payload ->
             result.set(if (status == ModuleResultStatus.SUCCESS) Result(true, WireMap.decode(payload), "") else Result(false, emptyMap(), String(payload)))
             latch.countDown()
         })
@@ -110,6 +110,9 @@ class PusherInstrumentedTest {
 
     private fun pusher(method: String, vararg values: Pair<String, WireValue>) =
         call(method, mapOf("client" to WireValue.Text("default"), *values))
+
+    private fun pusherOn(target: RealtimeModule, method: String, vararg values: Pair<String, WireValue>) =
+        call(method, mapOf("client" to WireValue.Text("default"), *values), target = target)
 
     private fun connect(extra: JSONObject.() -> Unit = {}) {
         val config = JSONObject()
@@ -258,5 +261,60 @@ class PusherInstrumentedTest {
         assertTrue(latch.await(5, TimeUnit.SECONDS))
         assertEquals("Realtime client closed", failed.get())
         assertTrue(!pusher("pusherStatus").ok)
+    }
+
+    @Test
+    fun aRecreatedSurfaceHandsTheLiveClientToTheNextModule() {
+        connect()
+        pusher("pusherSubscribe", "channel" to WireValue.Text("private-chat.42"))
+        until(subscribed("private-chat.42"))
+        val pending = CountDownLatch(1)
+        val read = AtomicReference<Result>()
+        module.invoke("pusherNext", WireMap.encode(mapOf("client" to WireValue.Text("default"))), ModuleCompletion { status, payload ->
+            read.set(if (status == ModuleResultStatus.SUCCESS) Result(true, WireMap.decode(payload), "") else Result(false, emptyMap(), String(payload)))
+            pending.countDown()
+        })
+
+        // PamRuntime.attach(): the new registry's module exists before the old one retires.
+        val successor = RealtimeModule(context)
+        try {
+            module.retireSurface()
+            module.close()
+            val status = JSONObject((pusherOn(successor, "pusherStatus").values["status"] as WireValue.Text).value)
+            assertEquals(2, status.getInt("s"))
+            assertEquals("1.1", status.getString("i"))
+            assertEquals(1, connections.get())
+
+            // The read PHP left pending on the retired module still completes.
+            sockets.single().send(frame("message.sent", "private-chat.42", "{\"n\":1}"))
+            assertTrue(pending.await(5, TimeUnit.SECONDS))
+            assertTrue(read.get().message, read.get().ok)
+            assertTrue((read.get().values["batch"] as WireValue.Text).value.contains("message.sent"))
+
+            sockets.single().send(frame("message.sent", "private-chat.42", "{\"n\":2}"))
+            val next = pusherOn(successor, "pusherNext")
+            assertTrue(next.message, next.ok)
+            assertTrue((next.values["batch"] as WireValue.Text).value.contains("{\\\"n\\\":2}"))
+            assertEquals(1, connections.get())
+        } finally {
+            successor.close()
+        }
+    }
+
+    @Test
+    fun aRetiredModuleWithoutSuccessorClosesItsClients() {
+        connect()
+        until(::connected)
+        val latch = CountDownLatch(1)
+        val failed = AtomicReference<String>()
+        module.invoke("pusherNext", WireMap.encode(mapOf("client" to WireValue.Text("default"))), ModuleCompletion { status, payload ->
+            if (status == ModuleResultStatus.FAILURE) failed.set(String(payload))
+            latch.countDown()
+        })
+        val successor = RealtimeModule(context)
+        successor.close()
+        module.retireSurface()
+        assertTrue(latch.await(5, TimeUnit.SECONDS))
+        assertEquals("Realtime client closed", failed.get())
     }
 }
