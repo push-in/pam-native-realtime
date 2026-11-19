@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3 - 2026-11-18
+
+- Fixed: liveness measures silence on a clock that counts deep sleep; returning to the foreground probes a socket silent for 30 s and reconnects if nothing answers in 5 s.
+- Fixed: channel auth requests time out (8 s read / 10 s call) and retry with backoff.
+
 ## 0.4.2 - 2026-11-18
 
 - Android: a recreated Activity no longer leaves the app without realtime. PAM Native retires the previous surface's module registry while the PHP runtime keeps running, and `RealtimeModule` closed every Pusher client and WebSocket there: PHP kept a stale `Connected` state, later calls hit a module with no client and nothing reconnected until the process was restarted. `RealtimeModule` is now a `SurfaceRetirableModule` that hands its live clients and sockets to the module replacing it (the read PHP left pending still completes).
