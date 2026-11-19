@@ -183,7 +183,14 @@ class PusherInstrumentedTest {
 
     @Test
     fun coalescesWhisperBurstsInBothDirections() {
-        connect()
+        // Coalescing is per batch. The loopback server writes the burst with Nagle on, so
+        // the first frame goes out alone and the rest wait ~40 ms for the client's delayed
+        // ACK: longer than the default 32 ms quiet window, which then released `n=0` on
+        // its own. A wider window keeps the whole burst in one batch on every API level.
+        connect {
+            put("quietMs", 250)
+            put("maxDelayMs", 1_000)
+        }
         pusher("pusherSubscribe", "channel" to WireValue.Text("presence-chat-typing.42"))
         val ready = until(subscribed("presence-chat-typing.42"))
         val members = JSONObject(ready.last(subscribed("presence-chat-typing.42")).getString("m"))
